@@ -7,6 +7,16 @@ description: 在远程主机上运行、调试本地开发的代码。当需要 
 
 本地编辑（内置 read/write/edit），远端运行调试（本包工具）。
 
+## ⓪ 目标与白名单（多机时先读这里）
+
+- 会话开始时用内置 read 检查工作区是否有 `pi-ssh-remote.json`：
+  - 有 → 记住其中的 `targets` 白名单（名字 → ssh_config Host 别名）与 `default`；之后所有远端工具用 `target` 参数指定目标。
+  - 没有 → 单目标模式（PI_SSH_HOST），不要向用户虚构多机能力。
+- 用户要给新机器开权限：编辑 `pi-ssh-remote.json` 在 `targets` 里登记（名字用 `[a-z0-9_-]`），并确认该 Host 别名在 `~/.ssh/config` 里可登录（`ssh_exec("hostname", {target})` 验证）。
+  **只能登进白名单内的机器；配置之外的主机名会被工具显式拒绝，不要尝试绕过。**
+- 配置文件改非法（JSON 语法错/host 含特殊字符/default 不在名单）时所有工具会显式报错——修好文件，不要删文件绕过。
+- **sync_push 与 ssh_exec 必须同一个 target**：推 A 机跑 B 机 = 跑旧代码，结果无效。
+
 ## ① 工具路由
 
 | 任务形态 | 工具 |
@@ -43,6 +53,7 @@ description: 在远程主机上运行、调试本地开发的代码。当需要 
 | sync_push 失败 | 代码未同步，**禁止**直接 ssh_exec 跑测试（跑的是旧代码，结果无效） |
 | `env_file_loaded: false` 且预期为 true | .env 未推送到远端，先 sync_push |
 | port_forward 报端口占用 | 显式换一个 local_port 重试，扩展不会自动换 |
+| 报 `不在白名单` | 在 `pi-ssh-remote.json` 的 targets 里登记该目标（并确认 ssh_config 可登录）后用 `target` 重试，不要绕过 |
 
 ## 参考模板（命中场景再读）
 
