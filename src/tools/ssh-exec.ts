@@ -5,6 +5,7 @@
 import { Type } from "typebox";
 import { execFile } from "node:child_process";
 import type { SshConnection } from "../connection.js";
+import type { TargetResolver } from "../targets.js";
 import { truncateMiddle, sq } from "../util.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -86,6 +87,9 @@ export function runRemote(conn: SshConnection, remoteCmd: string, timeoutMs: num
 
 export const sshExecParams = Type.Object({
   command: Type.String({ description: "Shell command to run on the remote host (bash -lc semantics)" }),
+  target: Type.Optional(
+    Type.String({ description: "Target name from pi-ssh-remote.json whitelist; default: config default. Unknown name => explicit error, never silently rerouted." }),
+  ),
   cwd: Type.Optional(Type.String({ description: "Remote working directory; defaults to the sync root" })),
   timeout_ms: Type.Optional(Type.Number({ description: `Timeout; default ${DEFAULT_TIMEOUT_MS}ms. On timeout the remote process GROUP is killed.` })),
   env: Type.Optional(
@@ -101,23 +105,26 @@ export const sshExecParams = Type.Object({
   ),
 });
 
-export function makeSshExecTool(conn: SshConnection, remoteRoot: string) {
+export function makeSshExecTool(resolve: TargetResolver) {
   return {
     name: "ssh_exec",
     label: "SSH Exec",
     description:
-      "Execute a shell command on the remote host over a persistent SSH connection (reused across calls; reconnects are reported). " +
+      "Execute a shell command on a remote host over a persistent SSH connection (one control connection per whitelisted target; reconnects are reported). " +
+      "Use `target` to pick a host from the pi-ssh-remote.json whitelist; unknown targets fail explicitly. " +
       "Stateless per call: pass cwd explicitly; .env is re-sourced each call when present. " +
       "IMPORTANT: never cat .env or run `env` to dump secrets into context — probe with `[ -n \"$KEY\" ] && echo set || echo unset`. " +
-      "Run sync_push first if you edited local files, otherwise the remote runs stale code.",
+      "Run sync_push first (same target!) if you edited local files, otherwise the remote runs stale code.",
     parameters: sshExecParams,
     async execute(_id: string, params: {
       command: string;
+      target?: string;
       cwd?: string;
       timeout_ms?: number;
       env?: Record<string, string>;
       env_file?: string | false;
     }) {
+      const { name, conn, remoteRoot } = resolve(params.target);
       const timeoutMs = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;
       await conn.ensureWithReconnectFlag();
 
@@ -154,6 +161,7 @@ export function makeSshExecTool(conn: SshConnection, remoteRoot: string) {
       return {
         content: [{ type: "text" as const, text: text || "(no output)" }],
         details: {
+          target: name,
           exit_code: out.exitCode,
           duration_ms: out.durationMs,
           timeout: out.timedOut || remoteTimedOut,

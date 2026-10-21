@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { SshConnection } from "../connection.js";
+import type { TargetResolver } from "../targets.js";
 import { sq } from "../util.js";
 
 export interface SyncStats {
@@ -40,19 +41,18 @@ function runRsync(args: string[], timeoutMs = 300_000): Promise<{ stdout: string
 }
 
 export interface SyncContext {
-  conn: SshConnection;
-  workspaceRoot: string;  // 本地工作区绝对路径
-  remoteRoot: string;     // 远端同步根
-  lastSync?: SyncStats;   // 最近一次 push 的统计（自检字段用）
+  resolve: TargetResolver; // 白名单解析（conn + 该目标的 remoteRoot）
+  workspaceRoot: string;   // 本地工作区绝对路径
+  lastSync?: SyncStats;    // 最近一次 push 的统计（自检字段用）
 }
 
 /** 确保远端根存在并收紧权限（700；.env 600 在 push 后单独处理） */
-async function ensureRemoteRoot(ctx: SyncContext): Promise<void> {
-  await ctx.conn.ensureWithReconnectFlag();
+async function ensureRemoteRoot(ctx: SyncContext, conn: SshConnection, remoteRoot: string): Promise<void> {
+  await conn.ensureWithReconnectFlag();
   const r = await runRsync([
-    "-e", `ssh -S ${ctx.conn.socketPath()}`,
-    "--rsync-path", `mkdir -p ${sq(ctx.remoteRoot)} && chmod 700 ${sq(ctx.remoteRoot)} && rsync`,
-    "-a", `${ctx.workspaceRoot}/.`, `${ctx.conn.hostLabel()}:${ctx.remoteRoot}/`,
+    "-e", `ssh -S ${conn.socketPath()}`,
+    "--rsync-path", `mkdir -p ${sq(remoteRoot)} && chmod 700 ${sq(remoteRoot)} && rsync`,
+    "-a", `${ctx.workspaceRoot}/.`, `${conn.hostLabel()}:${remoteRoot}/`,
     "--dry-run", "--out-format=%n", "--exclude=*",
   ]);
   // dry-run + exclude=* 不传输任何文件，仅借 rsync-path 钩子完成 mkdir/chmod
@@ -62,6 +62,9 @@ async function ensureRemoteRoot(ctx: SyncContext): Promise<void> {
 }
 
 export const syncPushParams = Type.Object({
+  target: Type.Optional(
+    Type.String({ description: "Target name from pi-ssh-remote.json whitelist; default: config default. Unknown name => explicit error." }),
+  ),
   paths: Type.Optional(
     Type.Array(Type.String(), {
       description: "Workspace-relative paths to push; default: whole workspace",
@@ -77,18 +80,20 @@ export function makeSyncPushTool(ctx: SyncContext) {
     name: "sync_push",
     label: "Sync Push",
     description:
-      "Incrementally push local workspace to the remote sync root via rsync over the persistent SSH connection. " +
+      "Incrementally push local workspace to a remote sync root via rsync over the persistent SSH connection. " +
+      "Use `target` to pick a host from the pi-ssh-remote.json whitelist; unknown targets fail explicitly. " +
       "Root .env is ALWAYS pushed even if gitignored, then chmod 600 remotely. " +
       "Non-zero rsync exit = this call FAILS (no silent partial sync). " +
       "Small-storage targets (routers): pass explicit `paths` whitelist instead of pushing the whole tree.",
     parameters: syncPushParams,
-    async execute(_id: string, params: { paths?: string[]; delete?: boolean }) {
-      await ensureRemoteRoot(ctx);
+    async execute(_id: string, params: { target?: string; paths?: string[]; delete?: boolean }) {
+      const { name, conn, remoteRoot } = ctx.resolve(params.target);
+      await ensureRemoteRoot(ctx, conn, remoteRoot);
 
       const args: string[] = [
         "-az",
         "--info=stats2",
-        "-e", `ssh -S ${ctx.conn.socketPath()}`,
+        "-e", `ssh -S ${conn.socketPath()}`,
         // .env 特例：include 先于 exclude-from 匹配（first-match wins）
         "--include=/.env",
         "--exclude=.git/",
@@ -106,8 +111,8 @@ export function makeSyncPushTool(ctx: SyncContext) {
       // 指定 paths 时不再套用 gitignore/exclude（白名单语义，spec §3.2 与场景文档 §2）
       const effectiveArgs =
         params.paths && params.paths.length > 0
-          ? ["-az", "--info=stats2", "-e", `ssh -S ${ctx.conn.socketPath()}`, "--relative", ...sources, `${ctx.conn.hostLabel()}:${ctx.remoteRoot}/`]
-          : [...args, ...sources, `${ctx.conn.hostLabel()}:${ctx.remoteRoot}/`];
+          ? ["-az", "--info=stats2", "-e", `ssh -S ${conn.socketPath()}`, "--relative", ...sources, `${conn.hostLabel()}:${remoteRoot}/`]
+          : [...args, ...sources, `${conn.hostLabel()}:${remoteRoot}/`];
 
       const started = Date.now();
       const r = await runRsync(effectiveArgs);
@@ -116,7 +121,7 @@ export function makeSyncPushTool(ctx: SyncContext) {
       }
 
       // 远端 .env 权限强制 600（无论本次是否传输了它）
-      await ctx.conn.runChecked(`[ ! -f ${sq(ctx.remoteRoot)}/.env ] || chmod 600 ${sq(ctx.remoteRoot)}/.env`);
+      await conn.runChecked(`[ ! -f ${sq(remoteRoot)}/.env ] || chmod 600 ${sq(remoteRoot)}/.env`);
 
       const stats = parseRsyncStats(r.stdout + r.stderr);
       ctx.lastSync = {
@@ -128,13 +133,14 @@ export function makeSyncPushTool(ctx: SyncContext) {
       return {
         content: [{
           type: "text" as const,
-          text: `pushed: ${stats.filesTransferred} files, ${stats.bytesTransferred} bytes in ${ctx.lastSync.durationMs}ms` +
+          text: `pushed [${name}]: ${stats.filesTransferred} files, ${stats.bytesTransferred} bytes in ${ctx.lastSync.durationMs}ms` +
             (params.delete ? " [--delete]" : ""),
         }],
         details: {
+          target: name,
           ...ctx.lastSync,
-          reconnected: ctx.conn.lastReconnected,
-          connection_age_ms: ctx.conn.connectionAgeMs,
+          reconnected: conn.lastReconnected,
+          connection_age_ms: conn.connectionAgeMs,
           env_file_chmod_enforced: true,
         },
       };
@@ -143,6 +149,9 @@ export function makeSyncPushTool(ctx: SyncContext) {
 }
 
 export const syncPullParams = Type.Object({
+  target: Type.Optional(
+    Type.String({ description: "Target name from pi-ssh-remote.json whitelist; default: config default. Unknown name => explicit error." }),
+  ),
   paths: Type.Array(Type.String(), {
     description: "Remote-root-relative artifact paths (logs, core dumps, build outputs)",
   }),
@@ -154,15 +163,17 @@ export function makeSyncPullTool(ctx: SyncContext) {
     label: "Sync Pull",
     description:
       "Pull remote artifacts (logs/core/build outputs) into local .remote-artifacts/. " +
+      "Use `target` to pick a host from the pi-ssh-remote.json whitelist; unknown targets fail explicitly. " +
       "Returns the pulled file list and sizes.",
     parameters: syncPullParams,
-    async execute(_id: string, params: { paths: string[] }) {
-      await ctx.conn.ensureWithReconnectFlag();
+    async execute(_id: string, params: { target?: string; paths: string[] }) {
+      const { name, conn, remoteRoot } = ctx.resolve(params.target);
+      await conn.ensureWithReconnectFlag();
       const localDir = path.join(ctx.workspaceRoot, ".remote-artifacts");
       fs.mkdirSync(localDir, { recursive: true });
 
-      const sources = params.paths.map((p) => `${ctx.conn.hostLabel()}:${ctx.remoteRoot}/${p}`);
-      const args = ["-az", "--info=stats2", "-e", `ssh -S ${ctx.conn.socketPath()}`, ...sources, `${localDir}/`];
+      const sources = params.paths.map((p) => `${conn.hostLabel()}:${remoteRoot}/${p}`);
+      const args = ["-az", "--info=stats2", "-e", `ssh -S ${conn.socketPath()}`, ...sources, `${localDir}/`];
 
       const r = await runRsync(args);
       if (r.code !== 0) {
@@ -173,12 +184,13 @@ export function makeSyncPullTool(ctx: SyncContext) {
       return {
         content: [{
           type: "text" as const,
-          text: `pulled ${stats.filesTransferred} files (${stats.bytesTransferred} bytes) into .remote-artifacts/`,
+          text: `pulled [${name}] ${stats.filesTransferred} files (${stats.bytesTransferred} bytes) into .remote-artifacts/`,
         }],
         details: {
+          target: name,
           ...stats,
-          reconnected: ctx.conn.lastReconnected,
-          connection_age_ms: ctx.conn.connectionAgeMs,
+          reconnected: conn.lastReconnected,
+          connection_age_ms: conn.connectionAgeMs,
         },
       };
     },
