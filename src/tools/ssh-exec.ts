@@ -34,9 +34,11 @@ export function buildRemoteCommand(opts: {
   const parts: string[] = [];
 
   // 1) env 文件加载（语法错误必须让整体失败：set -e 生效期内 source）
+  //    存在性经 stderr 标记位回探（spec §3.1a：env_file_loaded 必须如实 true/false）
   if (envFilePath) {
     parts.push(
-      `[ ! -f ${sq(envFilePath)} ] || { set -e; set -a; . ${sq(envFilePath)}; set +a; set +e; }`,
+      `if [ -f ${sq(envFilePath)} ]; then echo "__PI_ENVFILE_LOADED__" >&2; ` +
+        `set -e; set -a; . ${sq(envFilePath)}; set +a; set +e; fi`,
     );
   }
   // 2) 显式 env 键值，优先级高于 env 文件（后 export 覆盖）
@@ -121,8 +123,16 @@ export function makeSshExecTool(conn: SshConnection, remoteRoot: string) {
       });
 
       const out = await runRemote(conn, remoteCmd, timeoutMs);
+      // 剥离 env 标记位，得到真实 env_file_loaded
+      const envLoadedMarker = "__PI_ENVFILE_LOADED__";
+      const envFileLoaded =
+        params.env_file === false ? false : out.stderr.includes(envLoadedMarker);
+      const cleanStderr = out.stderr
+        .split("\n")
+        .filter((l) => !l.includes(envLoadedMarker))
+        .join("\n");
       const stdout = truncateMiddle(out.stdout);
-      const stderr = truncateMiddle(out.stderr);
+      const stderr = truncateMiddle(cleanStderr);
 
       const text = [
         stdout.text,
@@ -138,12 +148,11 @@ export function makeSshExecTool(conn: SshConnection, remoteRoot: string) {
           timeout: out.timedOut,
           reconnected: conn.lastReconnected,
           connection_age_ms: conn.connectionAgeMs,
-          env_file_loaded: params.env_file === false ? false : undefined,
+          env_file_loaded: envFileLoaded,
           truncated: stdout.truncated || stderr.truncated || undefined,
-          original_bytes:
-            stdout.truncated || stderr.truncated
-              ? stdout.originalBytes + stderr.originalBytes
-              : undefined,
+          original_bytes: stdout.truncated || stderr.truncated
+            ? stdout.originalBytes + stderr.originalBytes
+            : undefined,
         },
       };
     },
