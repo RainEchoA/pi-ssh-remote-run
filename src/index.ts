@@ -1,10 +1,11 @@
 /**
  * pi-ssh-remote-run 入口（spec §7）
- * M1：connection + ssh_exec。sync/forward/session 见里程碑 M2/M3/M5。
+ * M1：connection + ssh_exec。M2：sync_push / sync_pull。forward/session 见 M3/M5。
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { SshConnection } from "./connection.js";
 import { makeSshExecTool } from "./tools/ssh-exec.js";
+import { makeSyncPushTool, makeSyncPullTool, type SyncContext } from "./tools/sync.js";
 import { createHash } from "node:crypto";
 
 export default function (pi: ExtensionAPI) {
@@ -31,6 +32,10 @@ export default function (pi: ExtensionAPI) {
 
   const conn = new SshConnection(host);
   pi.registerTool(makeSshExecTool(conn, remoteRoot));
+
+  const syncCtx: SyncContext = { conn, workspaceRoot: process.cwd(), remoteRoot };
+  pi.registerTool(makeSyncPushTool(syncCtx));
+  pi.registerTool(makeSyncPullTool(syncCtx));
 
   pi.on("session_shutdown", async () => {
     await conn.close();

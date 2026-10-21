@@ -49,6 +49,30 @@ export class SshConnection {
     return this.masterStartedAt ? Date.now() - this.masterStartedAt : 0;
   }
 
+  /** rsync -e 复用控制连接所需 */
+  socketPath(): string {
+    return this.socket;
+  }
+
+  hostLabel(): string {
+    return this.host;
+  }
+
+  /** 执行远端命令，非零退出即抛错（供 sync 的远端权限修正等使用） */
+  async runChecked(remoteCommand: string, timeoutMs = 15000): Promise<string> {
+    await this.ensureWithReconnectFlag();
+    return new Promise((resolve, reject) => {
+      execFile("ssh", this.execArgs(remoteCommand), { timeout: timeoutMs }, (err, stdout, stderr) => {
+        const code = err && typeof err.code === "number" ? err.code : err ? 1 : 0;
+        if (code !== 0) {
+          reject(new Error(`远端命令失败(exit ${code})：${(stderr ?? "").trim()}`));
+        } else {
+          resolve(stdout ?? "");
+        }
+      });
+    });
+  }
+
   private run(args: string[], timeoutMs = 15000): Promise<{ stdout: string; stderr: string; code: number }> {
     return new Promise((resolve) => {
       execFile("ssh", args, { timeout: timeoutMs }, (err: ExecFileException | null, stdout: string, stderr: string) => {
@@ -91,8 +115,8 @@ export class SshConnection {
   }
 
   /**
-   * 确保控制连接可用。每次工具调用前调用。
-   * 断链时自动重建并置 lastReconnected = true（由调用方上报）。
+   * 确保控制连接可用（每次工具调用前调用）。
+   * 断链时自动重建并置 lastReconnected = true（spec §4：如实上报）。
    */
   async ensureWithReconnectFlag(): Promise<void> {
     const hadMaster = this.masterStartedAt > 0;
@@ -103,8 +127,8 @@ export class SshConnection {
         throw new SshError("控制连接建立后探活仍失败", "unknown", "");
       }
     }
-    // 已有过主连接且刚刚（5s 内）重建 → 上报 reconnected
-    this.lastReconnected = hadMaster && !wasAlive && Date.now() - this.masterStartedAt < 5000;
+    // 已有过主连接且刚刚重建 → 上报 reconnected
+    this.lastReconnected = hadMaster && !wasAlive;
   }
 
   /** 通过控制连接执行远端命令的参数（调用方负责超时/截断） */
