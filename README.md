@@ -15,6 +15,10 @@ Pi coding agent 扩展：**本地开发，远程运行调试**。内置 read/wri
 
 设计规格：[docs/spec.zh-CN.md](docs/spec.zh-CN.md)（含 16 条实测验收标准）。
 
+## 场景文档
+
+- [macOS 开发 OpenWrt 插件 → 测试路由器](docs/scenarios/macos-openwrt-plugin.md)
+
 ## 安装与配置
 
 ```bash
