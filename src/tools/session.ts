@@ -6,13 +6,14 @@
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import type { SshConnection } from "../connection.js";
+import type { TargetResolver, ResolvedTarget } from "../targets.js";
 import { truncateMiddle, sq } from "../util.js";
 
 const NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const DONE_RE = (id: string) => new RegExp(`__PI_DONE_${id}__(\\d+)`);
 
 export interface SessionManager {
-  /** persist=false 的会话名，session_shutdown 时清理 */
+  /** persist=false 的会话（"目标名:tmux会话名"），session_shutdown 时清理 */
   ephemeral: Set<string>;
 }
 
@@ -25,6 +26,9 @@ export const sshSessionParams = Type.Object({
   action: Type.Union(
     ["open", "send", "wait", "capture", "list", "close"].map((v) => Type.Literal(v)),
     { description: "open/send/wait/capture/list/close" },
+  ),
+  target: Type.Optional(
+    Type.String({ description: "Target name from pi-ssh-remote.json whitelist; default: config default. Unknown name => explicit error." }),
   ),
   name: Type.Optional(Type.String({ description: 'Session name [a-zA-Z0-9_-], default "default"; tmux name = pi-<name>' })),
   cwd: Type.Optional(Type.String({ description: "open: remote working directory" })),
@@ -40,8 +44,8 @@ export const sshSessionParams = Type.Object({
   persist: Type.Optional(Type.Boolean({ description: "open: survive pi session exit; default false" })),
 });
 
-export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, remoteRoot: string) {
-  /** 每个会话最近一次 send 的哨兵 id（wait 缺省 pattern 用） */
+export function makeSshSessionTool(resolve: TargetResolver, mgr: SessionManager) {
+  /** 每个会话最近一次 send 的哨兵 id（key = "目标:tmux会话名"，wait 缺省 pattern 用） */
   const lastSentinel = new Map<string, string>();
 
   const tname = (name?: string) => {
@@ -55,17 +59,22 @@ export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, rem
     label: "SSH Session",
     description:
       "Stateful remote shell session backed by remote tmux (survives reconnects; enumerable/killable). " +
+      "Use `target` to pick a host from the pi-ssh-remote.json whitelist; unknown targets fail explicitly. " +
       "Use for interactive REPL/gdb/multi-step stateful work; use ssh_exec for one-shot commands. " +
       "send auto-wraps a done-sentinel; completion is judged by wait() matching the sentinel and parsing exit_code — " +
       "NEVER treat captured output as completion.",
     parameters: sshSessionParams,
     async execute(_id: string, params: {
       action: "open" | "send" | "wait" | "capture" | "list" | "close";
+      target?: string;
       name?: string; cwd?: string; env_file?: string | false;
       input?: string; pattern?: string; timeout_ms?: number; lines?: number; persist?: boolean;
     }): Promise<any> {
+      const resolved: ResolvedTarget = resolve(params.target);
+      const { name: targetName, conn, remoteRoot } = resolved;
       await conn.ensureWithReconnectFlag();
-      const base = { reconnected: conn.lastReconnected, connection_age_ms: conn.connectionAgeMs };
+      const base = { target: targetName, reconnected: conn.lastReconnected, connection_age_ms: conn.connectionAgeMs };
+      const key = (t: string) => `${targetName}:${t}`;
 
       switch (params.action) {
         case "open": {
@@ -88,7 +97,7 @@ export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, rem
           init.push(`cd ${sq(params.cwd ?? remoteRoot)}`);
           await tmux(conn, `send-keys -t ${sq(t)} -l ${sq(init.join("; "))}`);
           await tmux(conn, `send-keys -t ${sq(t)} Enter`);
-          if (!params.persist) mgr.ephemeral.add(t);
+          if (!params.persist) mgr.ephemeral.add(key(t));
           return { content: [{ type: "text" as const, text: `session ${t}: opened` }], details: { ...base, name: t, opened: true, persist: !!params.persist } };
         }
 
@@ -100,14 +109,14 @@ export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, rem
           // send-keys -l 字面模式，Enter 单独发送（spec §3.6）
           await tmux(conn, `send-keys -t ${sq(t)} -l ${sq(wrapped)}`);
           await tmux(conn, `send-keys -t ${sq(t)} Enter`);
-          lastSentinel.set(t, id);
+          lastSentinel.set(key(t), id);
           return { content: [{ type: "text" as const, text: `sent to ${t} (sentinel ${id}); use wait to detect completion` }], details: { ...base, name: t, sent: true, sentinel: id } };
         }
 
         case "wait": {
           const t = tname(params.name);
           const timeoutMs = params.timeout_ms ?? 60_000;
-          const sentinel = params.pattern ? null : lastSentinel.get(t);
+          const sentinel = params.pattern ? null : lastSentinel.get(key(t));
           if (!params.pattern && !sentinel) throw new Error(`会话 ${t} 尚无 send 记录，wait 需显式 pattern`);
           const re = params.pattern ? new RegExp(params.pattern) : DONE_RE(sentinel!);
           const deadline = Date.now() + timeoutMs;
@@ -150,8 +159,8 @@ export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, rem
           const t = tname(params.name);
           const r = await tmux(conn, `kill-session -t ${sq(t)} 2>&1`);
           if (r.code !== 0) throw new Error(`close 失败（会话 ${t} 不存在？）：${r.stderr.trim() || r.stdout.trim()}`);
-          mgr.ephemeral.delete(t);
-          lastSentinel.delete(t);
+          mgr.ephemeral.delete(key(t));
+          lastSentinel.delete(key(t));
           return { content: [{ type: "text" as const, text: `session ${t}: closed` }], details: { ...base, name: t, closed: true } };
         }
       }
@@ -159,9 +168,17 @@ export function makeSshSessionTool(conn: SshConnection, mgr: SessionManager, rem
   };
 }
 
-/** session_shutdown：kill 全部 persist=false 会话 */
-export async function cleanupSessions(conn: SshConnection, mgr: SessionManager): Promise<void> {
-  for (const t of mgr.ephemeral) {
+/** session_shutdown：kill 全部 persist=false 会话（按目标找到各自连接） */
+export async function cleanupSessions(
+  mgr: SessionManager,
+  resolvedTargets: readonly { name: string; conn: SshConnection }[],
+): Promise<void> {
+  for (const k of mgr.ephemeral) {
+    const sep = k.indexOf(":");
+    const targetName = k.slice(0, sep);
+    const t = k.slice(sep + 1);
+    const conn = resolvedTargets.find((x) => x.name === targetName)?.conn;
+    if (!conn) continue;
     try { await conn.runRaw(`tmux kill-session -t '${t}' 2>/dev/null`, 8000); } catch { /* 清理不抛错 */ }
   }
   mgr.ephemeral.clear();
