@@ -74,3 +74,51 @@ test("classifySshError 四类归因", () => {
 test("sq 单引号包裹", () => {
   assert.equal(sq("a'b"), "'a'\\''b'");
 });
+
+// ===== pi-ssh-remote.json 白名单配置（targets.ts） =====
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { loadTargetsConfig, TargetPool, singleTargetResolver } from "../src/targets.js";
+
+function withCfg(json: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cfg-"));
+  fs.writeFileSync(path.join(dir, "pi-ssh-remote.json"), json);
+  return dir;
+}
+
+test("loadTargetsConfig: 文件不存在返回 null", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cfg-"));
+  assert.equal(loadTargetsConfig(dir), null);
+});
+
+test("loadTargetsConfig: 合法配置", () => {
+  const dir = withCfg(JSON.stringify({
+    default: "gpu",
+    targets: { gpu: { host: "gpu-box" }, router: { host: "wrt", remote_root: "/tmp/x" } },
+  }));
+  const cfg = loadTargetsConfig(dir)!;
+  assert.equal(cfg.default, "gpu");
+  assert.equal(cfg.targets.router.remote_root, "/tmp/x");
+});
+
+test("loadTargetsConfig: 非法 JSON / 空 targets / 非法名 / 非法 host / default 不在名单 全部显式报错", () => {
+  assert.throws(() => loadTargetsConfig(withCfg("{oops")), /不是合法 JSON/);
+  assert.throws(() => loadTargetsConfig(withCfg('{"targets": {}}')), /为空/);
+  assert.throws(() => loadTargetsConfig(withCfg('{"targets": {"Bad Name": {"host": "x"}}}')), /非法目标名/);
+  assert.throws(() => loadTargetsConfig(withCfg('{"targets": {"a": {"host": "h; rm -rf /"}}}')), /host 非法/);
+  assert.throws(() => loadTargetsConfig(withCfg('{"targets": {"a": {"host": "x"}}, "default": "ghost"}')), /"default" 必须是/);
+});
+
+test("TargetPool: 白名单外目标显式拒绝且列出可用目标", () => {
+  const pool = new TargetPool({ targets: { gpu: { host: "gpu-box", remoteRoot: "~/r" } }, defaultName: "gpu" });
+  assert.throws(() => pool.resolve("evil"), /不在白名单.*gpu/s);
+  assert.equal(pool.resolve().name, "gpu");           // 缺省走默认目标
+  assert.equal(pool.resolve("gpu").remoteRoot, "~/r");
+});
+
+test("singleTargetResolver: 传错名字也按白名单拒绝", () => {
+  const r = singleTargetResolver(null as never, "/r", "default");
+  assert.throws(() => r("other"), /不在白名单/);
+  assert.equal(r().name, "default");
+});
