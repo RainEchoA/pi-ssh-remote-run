@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SshConnection } from "../src/connection.js";
+import { singleTargetResolver } from "../src/targets.js";
 import { makeSshExecTool } from "../src/tools/ssh-exec.js";
 import { makeSyncPushTool, makeSyncPullTool, type SyncContext } from "../src/tools/sync.js";
 
@@ -42,7 +43,7 @@ function remote(cmd: string): string {
 
 test("§8.1 冷启动 + 连接复用", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
-  const exec = makeSshExecTool(conn, remoteRoot);
+  const exec = makeSshExecTool(singleTargetResolver(conn, remoteRoot));
   const r1 = await exec.execute("1", { command: "hostname", env_file: false });
   assert.equal(r1.details.exit_code, 0);
   const r2 = await exec.execute("2", { command: "echo ok", env_file: false });
@@ -52,7 +53,7 @@ test("§8.1 冷启动 + 连接复用", { skip: SKIP }, async () => {
 
 test("§8.2 断链重建上报 reconnected", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
-  const exec = makeSshExecTool(conn, remoteRoot);
+  const exec = makeSshExecTool(singleTargetResolver(conn, remoteRoot));
   await exec.execute("1", { command: "true", env_file: false });
   await conn.close(); // 强杀控制连接
   const r = await exec.execute("2", { command: "true", env_file: false });
@@ -62,7 +63,7 @@ test("§8.2 断链重建上报 reconnected", { skip: SKIP }, async () => {
 
 test("§8.5 超时杀远端进程组", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
-  const exec = makeSshExecTool(conn, remoteRoot);
+  const exec = makeSshExecTool(singleTargetResolver(conn, remoteRoot));
   const t0 = Date.now();
   const r = await exec.execute("1", { command: "sleep 60", timeout_ms: 2000, env_file: false });
   assert.ok(Date.now() - t0 < 15000, "超时应在秒级返回");
@@ -75,7 +76,7 @@ test("§8.5 超时杀远端进程组", { skip: SKIP }, async () => {
 
 test("§8.6 输出截断标注", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
-  const exec = makeSshExecTool(conn, remoteRoot);
+  const exec = makeSshExecTool(singleTargetResolver(conn, remoteRoot));
   const r = await exec.execute("1", { command: "head -c 1048576 /dev/zero | tr '\\0' 'x'", env_file: false, timeout_ms: 60000 });
   assert.equal(r.details.truncated, true);
   assert.ok((r.details.original_bytes as number) >= 1048576);
@@ -84,9 +85,9 @@ test("§8.6 输出截断标注", { skip: SKIP }, async () => {
 
 test("§8.10/11/12 env 文件闭环 + 防泄漏 + 权限强制", { skip: SKIP }, async () => {
   const { conn, workspace, remoteRoot } = setup();
-  const ctx: SyncContext = { conn, workspaceRoot: workspace, remoteRoot };
+  const ctx: SyncContext = { resolve: singleTargetResolver(conn, remoteRoot), workspaceRoot: workspace };
   const push = makeSyncPushTool(ctx);
-  const exec = makeSshExecTool(conn, remoteRoot);
+  const exec = makeSshExecTool(singleTargetResolver(conn, remoteRoot));
 
   // push：.env 突破 gitignore；ignored.tmp 不同步
   const pr = await push.execute("1", {});
@@ -121,7 +122,7 @@ test("§8.10/11/12 env 文件闭环 + 防泄漏 + 权限强制", { skip: SKIP },
 
 test("sync_pull 拉回产物", { skip: SKIP }, async () => {
   const { conn, workspace, remoteRoot } = setup();
-  const ctx: SyncContext = { conn, workspaceRoot: workspace, remoteRoot };
+  const ctx: SyncContext = { resolve: singleTargetResolver(conn, remoteRoot), workspaceRoot: workspace };
   const push = makeSyncPushTool(ctx);
   await push.execute("1", {});
   remote(`echo crashlog > ${remoteRoot}/run.log`);
@@ -136,8 +137,8 @@ test("sync_pull 拉回产物", { skip: SKIP }, async () => {
 test("§8.7 port_forward 端口冲突显式报错", { skip: SKIP }, async () => {
   const { conn } = setup();
   const { makePortForwardTool } = await import("../src/tools/forward.js");
-  const forwards: import("../src/tools/forward.js").Forward[] = [];
-  const fwd = makePortForwardTool(conn, forwards);
+  const forwards: import("../src/tools/forward.js").ForwardRegistry = new Map();
+  const fwd = makePortForwardTool(singleTargetResolver(conn, "/tmp/unused"), forwards);
   const r = await fwd.execute("1", { remote_port: 29876, local_port: 29876 });
   assert.equal(r.details.local_port, 29876);
   // 本地占用该端口后再请求 → 显式报错且不换端口
@@ -145,18 +146,18 @@ test("§8.7 port_forward 端口冲突显式报错", { skip: SKIP }, async () => 
   const blocker = net.createServer().listen(29877, "127.0.0.1");
   await new Promise((res) => blocker.on("listening", res));
   await assert.rejects(() => fwd.execute("2", { remote_port: 2345, local_port: 29877 }), /被占用/);
-  assert.ok(!forwards.some((f) => f.localPort === 29877), "失败不得登记转发");
+  assert.ok(![...forwards.values()].flat().some((f) => f.localPort === 29877), "失败不得登记转发");
   blocker.close();
   const { closeAllForwards } = await import("../src/tools/forward.js");
-  await closeAllForwards(conn, forwards);
+  await closeAllForwards(forwards, [{ name: "default", conn }]);
   await conn.close();
 });
 
 test("port_forward 转发通路可用（远端起 http 服务验证）", { skip: SKIP }, async () => {
   const { conn } = setup();
   const { makePortForwardTool, closeAllForwards } = await import("../src/tools/forward.js");
-  const forwards: import("../src/tools/forward.js").Forward[] = [];
-  const fwd = makePortForwardTool(conn, forwards);
+  const forwards: import("../src/tools/forward.js").ForwardRegistry = new Map();
+  const fwd = makePortForwardTool(singleTargetResolver(conn, "/tmp/unused"), forwards);
   // e2e 环境 remote==localhost，共享端口命名空间：远端服务端口与本地转发端口必须错开
   const port = 29000 + Math.floor(Math.random() * 500);
   const localPort = port + 1000;
@@ -165,7 +166,7 @@ test("port_forward 转发通路可用（远端起 http 服务验证）", { skip:
   const body = execFileSync("curl", ["-s", "--max-time", "5", `http://127.0.0.1:${localPort}/`], { encoding: "utf8" });
   assert.match(body, /Directory listing|html/i, "转发通路应拿到远端 http 响应");
   remote(`pkill -f "[h]ttp.server ${port}" || true`);
-  await closeAllForwards(conn, forwards);
+  await closeAllForwards(forwards, [{ name: "default", conn }]);
   await conn.close();
 });
 
@@ -174,7 +175,7 @@ test("§8.13/14 会话闭环 + 哨兵完成检测 + exit_code 如实上报", { s
   const { conn, remoteRoot } = setup();
   const { makeSshSessionTool, cleanupSessions } = await import("../src/tools/session.js");
   const mgr = { ephemeral: new Set<string>() };
-  const sess = makeSshSessionTool(conn, mgr, remoteRoot);
+  const sess = makeSshSessionTool(singleTargetResolver(conn, remoteRoot), mgr);
 
   const o = await sess.execute("1", { action: "open", name: "t1" });
   assert.equal(o.details.opened, true);
@@ -195,7 +196,7 @@ test("§8.13/14 会话闭环 + 哨兵完成检测 + exit_code 如实上报", { s
   const l = await sess.execute("9", { action: "list" });
   assert.ok(!(l.details.sessions as string[]).includes("pi-t1"));
   await assert.rejects(() => sess.execute("10", { action: "close", name: "t1" }), /close 失败/);
-  await cleanupSessions(conn, mgr);
+  await cleanupSessions(mgr, [{ name: "default", conn }]);
   await conn.close();
 });
 
@@ -203,7 +204,7 @@ test("§8.14 capture 无哨兵不算完成", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
   const { makeSshSessionTool, cleanupSessions } = await import("../src/tools/session.js");
   const mgr = { ephemeral: new Set<string>() };
-  const sess = makeSshSessionTool(conn, mgr, remoteRoot);
+  const sess = makeSshSessionTool(singleTargetResolver(conn, remoteRoot), mgr);
   await sess.execute("1", { action: "open", name: "t2" });
   await sess.execute("2", { action: "send", name: "t2", input: "sleep 4 && echo done-marker" });
   const cap = await sess.execute("3", { action: "capture", name: "t2" });
@@ -212,7 +213,7 @@ test("§8.14 capture 无哨兵不算完成", { skip: SKIP }, async () => {
   assert.equal(w.details.matched, true);
   assert.equal(w.details.exit_code, 0);
   await sess.execute("5", { action: "close", name: "t2" });
-  await cleanupSessions(conn, mgr);
+  await cleanupSessions(mgr, [{ name: "default", conn }]);
   await conn.close();
 });
 
@@ -220,7 +221,7 @@ test("§8.15 断链重建后 tmux 会话无损；持久/临时会话语义", { s
   const { conn, remoteRoot } = setup();
   const { makeSshSessionTool, cleanupSessions } = await import("../src/tools/session.js");
   const mgr = { ephemeral: new Set<string>() };
-  const sess = makeSshSessionTool(conn, mgr, remoteRoot);
+  const sess = makeSshSessionTool(singleTargetResolver(conn, remoteRoot), mgr);
   await sess.execute("1", { action: "open", name: "keep", persist: true });
   await sess.execute("2", { action: "send", name: "keep", input: "echo survive-$RANDOM > /tmp/pi-keep-marker; cat /tmp/pi-keep-marker" });
   const w = await sess.execute("3", { action: "wait", name: "keep", timeout_ms: 15000 });
@@ -232,20 +233,20 @@ test("§8.15 断链重建后 tmux 会话无损；持久/临时会话语义", { s
   const l = await sess.execute("5", { action: "list" });
   assert.ok((l.details.sessions as string[]).includes("pi-keep"));
   await sess.execute("6", { action: "close", name: "keep" });
-  await cleanupSessions(conn, mgr);
+  await cleanupSessions(mgr, [{ name: "default", conn }]);
   await conn.close();
 });
 
 test("ssh_session 非法会话名拒绝", { skip: SKIP }, async () => {
   const { conn, remoteRoot } = setup();
   const { makeSshSessionTool } = await import("../src/tools/session.js");
-  const sess = makeSshSessionTool(conn, { ephemeral: new Set() }, remoteRoot);
+  const sess = makeSshSessionTool(singleTargetResolver(conn, remoteRoot), { ephemeral: new Set() });
   await assert.rejects(() => sess.execute("1", { action: "open", name: "bad;rm -rf" }), /非法会话名/);
 });
 
 test("§8.3 认证失败显式报错（不挂死）", { skip: SKIP }, async () => {
   const bad = new SshConnection("ci-remote-badkey"); // CI 配置：指向同 sshd 但用错误密钥
-  const exec = makeSshExecTool(bad, "/tmp/pi-e2e-remote-bad");
+  const exec = makeSshExecTool(singleTargetResolver(bad, "/tmp/pi-e2e-remote-bad", "bad"));
   const t0 = Date.now();
   await assert.rejects(() => exec.execute("1", { command: "true" }), /认证失败|authentication/i);
   assert.ok(Date.now() - t0 < 30000, "认证失败必须快速返回");
@@ -256,8 +257,8 @@ test("§8.9 多工作区隔离", { skip: SKIP }, async () => {
   const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-e2e-ws2-"));
   fs.writeFileSync(path.join(ws2, "only-ws2.txt"), "2\n");
   const root2 = `${remoteRoot}-ws2`;
-  const ctx1: SyncContext = { conn, workspaceRoot: workspace, remoteRoot };
-  const ctx2: SyncContext = { conn, workspaceRoot: ws2, remoteRoot: root2 };
+  const ctx1: SyncContext = { resolve: singleTargetResolver(conn, remoteRoot), workspaceRoot: workspace };
+  const ctx2: SyncContext = { resolve: singleTargetResolver(conn, root2, "ws2"), workspaceRoot: ws2 };
   await makeSyncPushTool(ctx1).execute("1", {});
   await makeSyncPushTool(ctx2).execute("2", {});
   assert.notEqual(remoteRoot, root2);
@@ -265,4 +266,32 @@ test("§8.9 多工作区隔离", { skip: SKIP }, async () => {
   assert.match(l2, /only-ws2\.txt/);
   assert.doesNotMatch(l2, /hello\.txt/, "ws2 不得包含 ws1 的文件");
   await conn.close();
+});
+
+// ===== 多目标白名单（pi-ssh-remote.json / TargetPool） =====
+test("target 参数路由到指定目标；未知目标显式拒绝", { skip: SKIP }, async () => {
+  const { TargetPool } = await import("../src/targets.js");
+  const pool = new TargetPool({
+    targets: {
+      a: { host: "ci-remote", remoteRoot: `/tmp/pi-e2e-mt-a-${process.pid}` },
+      b: { host: "ci-remote", remoteRoot: `/tmp/pi-e2e-mt-b-${process.pid}` },
+    },
+    defaultName: "a",
+  });
+  const exec = makeSshExecTool(pool.resolve);
+  // 默认目标
+  const r0 = await exec.execute("1", { command: "echo default-ok", env_file: false });
+  assert.equal(r0.details.target, "a");
+  // 显式目标：写不同文件证明路由隔离
+  await exec.execute("2", { command: "mkdir -p /tmp/pi-e2e-mt-a-" + process.pid + " && echo A > /tmp/pi-e2e-mt-a-" + process.pid + "/mark", env_file: false });
+  await exec.execute("3", { target: "b", command: "mkdir -p /tmp/pi-e2e-mt-b-" + process.pid + " && echo B > /tmp/pi-e2e-mt-b-" + process.pid + "/mark", env_file: false });
+  const ra = await exec.execute("4", { target: "a", command: "cat /tmp/pi-e2e-mt-a-" + process.pid + "/mark", env_file: false });
+  assert.match((ra.content[0] as { text: string }).text, /A/);
+  assert.equal(ra.details.target, "a");
+  const rb = await exec.execute("5", { target: "b", command: "cat /tmp/pi-e2e-mt-b-" + process.pid + "/mark", env_file: false });
+  assert.match((rb.content[0] as { text: string }).text, /B/);
+  assert.equal(rb.details.target, "b");
+  // 未知目标：显式报错，列出白名单，绝不静默路由
+  await assert.rejects(() => exec.execute("6", { target: "evil", command: "hostname" }), /不在白名单.*a, b/s);
+  await pool.closeAll();
 });
