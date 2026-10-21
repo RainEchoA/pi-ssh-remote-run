@@ -1,7 +1,7 @@
 # pi-ssh-remote-run 设计规格
 
 > pi coding agent 扩展：本地开发、远程运行调试
-> 版本：v0.1-draft · 2026-10-21
+> 版本：v0.2 · 2026-10-22（M1–M5 全部落地 + 多目标白名单 §3.0）
 
 ## 1. 目标与定位
 
@@ -12,8 +12,8 @@
 ### 1.1 非目标
 
 - 不做整个内置工具面的远程委托（即不做官方 `ssh.ts` 示例那种 read/write/edit/bash 全委托形态）。
-- 不做交互式断点调试（DAP）。agent 侧调试以“复现脚本 + 批处理 gdb + py-spy 采样”为主；交互式断点留给人类。
-- 不做多主机编排。v0.1 单一目标主机；多机留扩展点。
+- 不做交互式断点调试（DAP）。agent 侧调试以"复现脚本 + 批处理 gdb + py-spy 采样"为主；交互式断点留给人类。
+- 不做多主机编排（一次操作只打一台机器）。多目标经 §3.0 白名单逐台指定，不做 fleet 广播。
 
 ## 2. 架构
 
@@ -21,11 +21,12 @@
 ┌─ pi agent ────────────────────────────────┐
 │ 内置 read/write/edit/bash      （本地，零改动）│
 │                                            │
-│ 本扩展注册 4 个工具：                        │
+│ 本扩展注册 5 个工具：                        │
 │   ssh_exec ─┐                              │
 │   sync_push ├─→ SSH 控制通道（ControlMaster）│
 │   sync_pull ┤    └─→ 远端主机               │
-│   port_forward ─┘   （执行 / rsync / 调试端口）│
+│   port_forward ┤   （执行 / rsync / 调试端口）│
+│   ssh_session ─┘    （tmux 有状态会话）       │
 └────────────────────────────────────────────┘
 ```
 
@@ -39,7 +40,7 @@
 | rsync | 天然复用同一控制连接 | 需额外桥接 |
 | 风险 | 依赖系统 ssh 存在（Linux/macOS 必有） | 纯 JS 可移植，但重复造配置体系 |
 
-选择系统 ssh 的理由：**配置单一事实源在 ssh_config**，扩展不重复实现 ProxyJump/端口/密钥逻辑，杜绝“扩展以为连上了、实际走了另一条配置”的静默分叉。
+选择系统 ssh 的理由：**配置单一事实源在 ssh_config**，扩展不重复实现 ProxyJump/端口/密钥逻辑，杜绝"扩展以为连上了、实际走了另一条配置"的静默分叉。
 
 ### 2.1 连接生命周期
 
@@ -48,12 +49,37 @@
 - pi 会话结束（`session_shutdown` 事件）时 `ssh -O exit` 显式关闭，不依赖 ControlPersist 超时兜底。
 - pi `/reload` 热重载 → 模块重建 → 旧控制连接由新模块显式接管或重建（同一 socket 路径可复用）。
 
+## 3.0 多目标与白名单（pi-ssh-remote.json）
+
+工作区根可放 `pi-ssh-remote.json` 登记允许登录的目标机器白名单：
+
+```json
+{
+  "default": "gpu",
+  "targets": {
+    "gpu":    { "host": "gpu-box", "remote_root": "~/pi-remote/proj" },
+    "router": { "host": "openwrt-test", "remote_root": "/tmp/pi-remote" }
+  }
+}
+```
+
+- `host` 必须指向 `~/.ssh/config` 的 Host 别名（本扩展不解析凭证，见 §6）；`remote_root` 可省，缺省按工作区派生。
+- 目标名 `[a-z0-9][a-z0-9_-]{0,31}`；host 别名 `[A-Za-z0-9._-]`，禁空白/元字符。
+- 全部五个工具带可选 `target` 参数；缺省 = 配置 `default`（未写 default 取第一个目标）。
+- 白名单语义：
+  - `target` 不在名单 → **显式报错并列出可用目标**，绝不静默路由到其他机器；
+  - 配置文件存在但非法（JSON 错误/host 含特殊字符/default 不在名单）→ 所有工具调用即报错，**不静默回退**到 PI_SSH_HOST；
+  - 文件不存在 → 合法，回退 PI_SSH_HOST 单目标（名为 `default`）。
+- 每个目标独立一条 ControlMaster 控制连接（懒建连）；转发、tmux 会话、哨兵记录均按目标隔离；session_shutdown 只清理已建连的目标。
+- skill 负责在会话开始时引导读取该配置（见 §9）。
+
 ## 3. 工具契约
 
 ### 3.1 `ssh_exec` — 远端执行
 
 ```typescript
 parameters: {
+  target?: string;            // §3.0 白名单目标名，缺省 = 配置 default；不在名单显式报错
   command: string;            // 远端 shell 命令（bash -lc 语义）
   cwd?: string;               // 远端工作目录，缺省为 sync 目标根
   timeout_ms?: number;        // 缺省 120_000，超时即杀远端进程组
@@ -69,7 +95,7 @@ parameters: {
 
 **语义约束**：
 
-- **无状态 shell**：每次调用独立 exec channel，cwd 必须显式传入；不存在“记住上次 cd”的隐式状态。env_file 同理——每次调用重新 source，不存在“上次加载过还在”的隐式状态。
+- **无状态 shell**：每次调用独立 exec channel，cwd 必须显式传入；不存在"记住上次 cd"的隐式状态。env_file 同理——每次调用重新 source，不存在"上次加载过还在"的隐式状态。
 - 超时杀死的是远端**进程组**（`setsid` 包裹），避免远端孤儿进程。
 - 输出经 `truncateHead/tail` 截断（单方向上限 100KB），截断时显式标注 `truncated: true + 原始字节数`。
 
@@ -82,7 +108,7 @@ bash -lc '[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a; exec <command
 ```
 
 - 用 `set -a` 包裹 source，文件内 `KEY=VALUE` 行**自动导出**为环境变量，兼容标准 .env 语法；注释/空行按 shell source 语义处理。
-- 加载失败（语法错误）：env 文件报错进 stderr 且 exit_code ≠ 0，**不允许**“文件坏了但命令裸跑成功”的假成功。
+- 加载失败（语法错误）：env 文件报错进 stderr 且 exit_code ≠ 0，**不允许**"文件坏了但命令裸跑成功"的假成功。
 - `env` 参数（显式键值）优先级**高于** env_file：注入顺序为先 source 文件、再 export 显式键。
 - `env_file_loaded` 字段如实报告本次是否实际加载了文件（文件不存在时为 `false`，不视为错误）。
 
@@ -90,6 +116,7 @@ bash -lc '[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a; exec <command
 
 ```typescript
 parameters: {
+  target?: string;    // §3.0 白名单目标名
   paths?: string[];   // 缺省整个工作区
   delete?: boolean;   // 缺省 false；true 时 rsync --delete（危险，需 agent 显式开）
 }
@@ -103,12 +130,15 @@ parameters: {
 - 远端落盘后立即 `chmod 600`，目录 `chmod 700`。
 - 自定义 env 文件（如 `.env.prod`）不自动推送，由 agent 显式 `sync_push(paths=[".env.prod"])`。
 
-返回：rsync stats（传输文件数、字节数、耗时），写入 tool result 的 `details`。**同步失败必须让本次调用失败**，不得返回“成功但部分文件没传”。
+返回：rsync stats（传输文件数、字节数、耗时），写入 tool result 的 `details`。**同步失败必须让本次调用失败**，不得返回"成功但部分文件没传"。
 
 ### 3.3 `sync_pull` — 远端 → 本地
 
 ```typescript
-parameters: { paths: string[]; }  // 相对远端工作根的产物路径（日志/core/构建产物）
+parameters: {
+  target?: string;    // §3.0 白名单目标名
+  paths: string[];    // 相对远端工作根的产物路径（日志/core/构建产物）
+}
 ```
 
 拉回到本地工作区 `.remote-artifacts/` 目录，返回拉回文件清单与大小。
@@ -117,6 +147,7 @@ parameters: { paths: string[]; }  // 相对远端工作根的产物路径（日�
 
 ```typescript
 parameters: {
+  target?: string;     // §3.0 白名单目标名
   remote_port: number;
   local_port?: number;   // 缺省与 remote_port 相同；占用时显式报错，不静默换端口
 }
@@ -129,7 +160,7 @@ parameters: {
 每个工具的 result `details` 固定携带：
 
 ```
-remote_host, connection_age_ms, last_sync?: { files, bytes, at }
+target, remote_host, connection_age_ms, last_sync?: { files, bytes, at }
 ```
 
 让 agent 每次都能自检执行环境，不依赖会话记忆。
@@ -140,6 +171,7 @@ remote_host, connection_age_ms, last_sync?: { files, bytes, at }
 
 ```typescript
 parameters: {
+  target?: string;      // §3.0 白名单目标名
   action: "open" | "send" | "wait" | "capture" | "list" | "close";
   name?: string;          // 会话名，缺省 "default"；tmux session 名 = pi-<name>
   cwd?: string;           // open 时生效；env_file 语义同 §3.1a，open 时加载并驻留
@@ -163,7 +195,7 @@ parameters: {
 | list | `tmux ls`（过滤 `pi-` 前缀） | `{ sessions: [{ name, age_ms }] }` |
 | close | `tmux kill-session`；不存在则显式报错 | `{ closed: true }` |
 
-**完成检测（关键设计，防“捕获到输出 ≠ 命令跑完”）**：
+**完成检测（关键设计，防"捕获到输出 ≠ 命令跑完"）**：
 
 `send` 不裸发用户命令，实际发送：
 
@@ -171,7 +203,7 @@ parameters: {
 <user_cmd>; __rc=$?; echo "__PI_DONE_<uuid>__$__rc"
 ```
 
-`wait` 缺省 `pattern` 即该 uuid 哨兵，匹配后从标记解析 `exit_code` 如实上报。`pattern` 显式传入时则为纯输出匹配（用于 REPL 提示符等待等），此时 `exit_code` 缺省不解析。**绝不允许**“capture 到东西就当成功”。
+`wait` 缺省 `pattern` 即该 uuid 哨兵，匹配后从标记解析 `exit_code` 如实上报。`pattern` 显式传入时则为纯输出匹配（用于 REPL 提示符等待等），此时 `exit_code` 缺省不解析。**绝不允许**"capture 到东西就当成功"。
 
 **语义约束**：
 
@@ -188,7 +220,7 @@ parameters: {
 
 | 场景 | 行为 |
 |---|---|
-| ssh 不存在 / 版本过老 | 扩展加载即检测，缺失时工具注册为“加载即报错”形态，说明原因 |
+| ssh 不存在 / 版本过老 | 扩展加载即检测，缺失时工具注册为"加载即报错"形态，说明原因 |
 | 首次连接失败 | 抛错并区分原因：DNS / 认证 / 超时 / host key 未知（附 `ssh -v` 关键行） |
 | 运行中断链 | 下次调用自动重建，result 带 `reconnected: true`；重建失败显式抛错 |
 | rsync 部分失败 | exit code ≠ 0 → 工具调用整体失败，附 stderr |
@@ -197,22 +229,24 @@ parameters: {
 | 输出超限 | 截断 + `truncated: true` + 原始字节数 |
 | env 文件语法错误 | source 失败进 stderr、exit_code ≠ 0，不裸跑 |
 | env 文件权限异常 | 远端 .env 非 600 → sync_push 时强制修正并在 details 记录 |
+| target 不在白名单 | 显式报错并列出可用目标，**没有任何远端命令被执行** |
+| pi-ssh-remote.json 非法 | 所有工具调用即报错，不静默回退 PI_SSH_HOST |
 
-禁止行为清单：无输出挂死、静默降级到本地执行、吞掉 stderr、自动换端口不报告、**env 文件内容回显进 tool result**（见 §6 防泄漏）。
+禁止行为清单：无输出挂死、静默降级到本地执行、吞掉 stderr、自动换端口不报告、**env 文件内容回显进 tool result**（见 §6 防泄漏）、**白名单外主机静默路由**。
 
 ## 5. 远端环境约定
 
-- 远端同步根：`~/pi-remote/<工作区basename 的 hash>/`，避免多工作区互相覆盖。
+- 远端同步根：`~/pi-remote/<工作区basename 的 hash>/`，避免多工作区互相覆盖；多目标可在 `pi-ssh-remote.json` 里逐目标覆盖 `remote_root`。
 - 远端要求：`bash`、`rsync`；调试能力可选依赖 `gdb` / `py-spy`（缺失时相关用法报错提示安装，不影响 ssh_exec/sync）。
 - 远端命令统一 `bash -lc` 包裹，保证 login 环境（PATH 里的 conda/cargo 等可用）。
 
 ## 6. 配置与安全
 
-- 主机选择**唯一入口**：环境变量 `PI_SSH_HOST=<ssh_config 里的 Host 别名>`。ProxyJump、端口、密钥、用户名全部在 `~/.ssh/config`，扩展不解析、不覆盖。
+- 主机选择两个入口：工作区 `pi-ssh-remote.json` 白名单（§3.0，多目标），或环境变量 `PI_SSH_HOST=<ssh_config 里的 Host 别名>`（单目标）。ProxyJump、端口、密钥、用户名全部在 `~/.ssh/config`，扩展不解析、不覆盖。
 - `ssh_exec` 的 `env` 参数走白名单（默认只允许 `PATH` 追加与 `*` 以外的显式键），防止 agent 误传本地敏感变量到远端。
 - **.env 防泄漏**（.env 通常含 API key 等机密）：
   - 任何工具 result 不得包含 env 文件内容；`sync_push` 的 stats 只报文件名与字节数。
-  - 工具 description 中显式告诫模型：不要 `cat .env` / `env | grep` 打印机密到上下文；需要确认加载效果时用存在性探针。
+  - 工具 description 中显式告诫模型：不要 `cat .env` / `env | grep` 打印机密到上下文；需要确认加载效果时用 `ssh_exec("[ -n \"$KEY\" ] && echo set || echo unset")` 这类存在性探针。
   - 远端 .env 权限 600 由扩展强制保证（§3.2）。
 - socket 路径：`$XDG_RUNTIME_DIR/pi-ssh-%C.sock`，会话结束清理。
 - 扩展以用户完整权限运行（pi 扩展模型的固有限制），在 README 显著位置声明。
@@ -227,6 +261,7 @@ pi-ssh-remote-run/
 ├── src/
 │   ├── index.ts          # export default (pi: ExtensionAPI) => {...}
 │   ├── connection.ts     # ControlMaster 生命周期：ensure/check/rebuild/close
+│   ├── targets.ts        # pi-ssh-remote.json 白名单加载 + TargetPool（§3.0）
 │   ├── tools/
 │   │   ├── ssh-exec.ts
 │   │   ├── sync.ts        # push + pull
@@ -240,7 +275,7 @@ pi-ssh-remote-run/
 └── test/                  # 见 §8
 ```
 
-安装：`pi install npm:pi-ssh-remote-run`（发布后）或 `pi install git:github.com/RainEchoA/pi-ssh-remote-run`。
+安装：`pi install npm:pi-ssh-remote-run`（发布后）或 `pi install git:github.com/<user>/pi-ssh-remote-run`。
 
 ## 8. 验收标准（逐条实测，不接受纸面推断）
 
@@ -256,16 +291,17 @@ pi-ssh-remote-run/
 8. **会话清理**：pi 退出后控制 socket 消失、远端无遗留转发端口。
 9. **多工作区隔离**：两个不同本地目录分别 push，远端根不同、互不覆盖。
 10. **env 文件闭环**：本地 .env 含 `FOO=bar`（且已被 .gitignore 排除）→ `sync_push` 后远端存在、权限 600 → `ssh_exec("echo $FOO")` 输出 `bar`、result 带 `env_file_loaded: true`；`env_file: false` 时同一命令输出为空且 `env_file_loaded: false`；显式 `env: {FOO: "baz"}` 覆盖文件值输出 `baz`。
-11. **env 失败显式化**：远端 .env 写入一行语法错误（如 `===`）→ `ssh_exec` 返回非零 exit_code 且 stderr 含 source 报错，不出现“命令裸跑成功”。
+11. **env 失败显式化**：远端 .env 写入一行语法错误（如 `===`）→ `ssh_exec` 返回非零 exit_code 且 stderr 含 source 报错，不出现"命令裸跑成功"。
 12. **env 防泄漏**：`sync_push` 的 result 全文不含 .env 文件内容；远端权限被手动改为 644 后再次 push，自动回正为 600。
 13. **会话闭环**：`open` → `send("export X=1")` → `send("echo $X")` + `wait` → 匹配哨兵、`exit_code: 0`、输出含 `1`；`close` 后 `list` 为空；对不存在的会话 `close` 显式报错。
 14. **完成检测**：`send("sleep 5 && echo ok")` 后立即 `capture`（无哨兵）不算完成；`wait` 在 ~5s 后匹配并解析出 `exit_code`；`send("exit 3")` 经 `wait` 如实上报 `exit_code: 3`。
-15. **会话存续**：`persist: true` 的会话在 pi 进程重启后 `list` 可见、`capture` 能取回重启前的输出；`persist: false` 的在 pi 退出时被 kill（远端 `tmux ls` 验证）。断链重建（第 2 条路径）后已有会话不受影响。
-16. **skill 随包可用**：`pi install` 后新会话 `/skills` 列表含 `remote-runbook`；settings 中 `"skills": []` 关掉后四个工具仍注册可用（解耦验证）。
+15. **会话存续**：`persist: true` 的会话在 pi 进程重启后 `list` 可见、`capture` 能取回重启前的输出；`persist: false` 的在 pi 退出时被 kill（远端 `tmux ls` 验证）。断链重建（§8.2）后已有会话不受影响。
+16. **skill 随包可用**：`pi install` 后新会话 `/skills` 列表含 `remote-runbook`；settings 中 `"skills": []` 关掉后五个工具仍注册可用（解耦验证）。
+17. **多目标白名单**：配置两个目标 a/b（可指向同一 sshd 的不同 remote_root）。`ssh_exec` 不带 target → 落默认目标且 details.target 如实标注；带 `target: "b"` → 在 b 上执行（用各自落点写文件验证路由隔离）；带 `target: "evil"` → 显式报错且错误信息列出白名单，**没有任何远端命令被执行**；把配置改成非法 JSON 后任意工具调用即报错（不静默回退）。
 
 ## 9. Skill 设计：`remote-runbook`
 
-**定位**：工具给能力，skill 给使用知识。四个工具的 description 只写“是什么”；**何时用、怎么组合、踩坑纪律**全部放 skill。随包分发（§7 manifest），用户 `pi install` 后自动可用；pi 渐进披露——平时只占系统提示一行 name+description，任务命中才加载全文。
+**定位**：工具给能力，skill 给使用知识。五个工具的 description 只写"是什么"；**何时用、怎么组合、踩坑纪律**全部放 skill。随包分发（§7 manifest），用户 `pi install` 后自动可用；pi 渐进披露——平时只占系统提示一行 name+description，任务命中才加载全文。
 
 ### 9.1 SKILL.md 结构
 
@@ -277,9 +313,15 @@ description: 在远程主机上运行、调试本地开发的代码。当需要 
 ---
 ```
 
-正文四个部分：
+正文五个部分：
 
-**① 工具路由规则**（最重要，放最前）
+**⓪ 目标与白名单**（多机时先读）
+
+- 会话开始先读工作区 `pi-ssh-remote.json`：有 → 记住 targets 白名单与 default，之后用 `target` 参数；没有 → 单目标模式，不虚构多机能力。
+- 新机器只能在 `pi-ssh-remote.json` 登记后使用；白名单外被工具显式拒绝，不绕过。
+- **sync_push 与 ssh_exec 必须同一个 target**（推 A 跑 B = 跑旧代码）。
+
+**① 工具路由规则**
 
 | 任务形态 | 工具 |
 |---|---|
@@ -307,6 +349,7 @@ description: 在远程主机上运行、调试本地开发的代码。当需要 
 - `reconnected: true` → 注意远端有状态操作（ssh_exec 的 cwd/env 无状态不受影响；ssh_session 由 tmux 持有不受影响），但需重新确认远端进程是否还在。
 - `timeout: true` → 远端进程组已被杀，不要假设它还在跑。
 - rsync 失败 → 代码未同步，禁止直接 ssh_exec 跑测试（跑的是旧代码，结果无效）。
+- 报 `不在白名单` → 在 `pi-ssh-remote.json` 登记目标后用 `target` 重试，不绕过。
 
 ### 9.2 设计约束
 
@@ -324,3 +367,4 @@ description: 在远程主机上运行、调试本地开发的代码。当需要 
 | M3 | port_forward + 会话清理 | §8 第 7/8 条 |
 | M4 | README、manifest、remote-runbook skill、发布 npm | `pi install` 全新环境一遍通过 + §8 第 16 条 |
 | M5（v0.2） | ssh_session（tmux 有状态会话） | §8 第 13/14/15 条 |
+| M6（v0.2） | 多目标白名单 pi-ssh-remote.json + target 参数 | §8 第 17 条 |
