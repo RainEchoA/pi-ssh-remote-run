@@ -7,8 +7,8 @@ Pi coding agent 扩展：**本地开发，远程运行调试**。内置 read/wri
 
 | 工具 | 状态 | 说明 |
 |---|---|---|
-| `ssh_exec` | M1 ✅ | 远端执行，无状态 shell，env_file 自动加载，超时杀远端进程组 |
-| `sync_push` / `sync_pull` | M2 | rsync 增量同步（.env 特例：突破 gitignore 总是推送） |
+| `ssh_exec` | M1 ✅ | 远端执行，无状态 shell，env_file 自动加载+存在性回探，超时杀远端进程组 |
+| `sync_push` / `sync_pull` | M2 ✅ | rsync 增量同步（.env 特例：突破 gitignore 总是推送 + 远端 600 强制；paths 白名单模式） |
 | `port_forward` | M3 | 调试端口转发 |
 | `ssh_session` | M5 (v0.2) | tmux 有状态会话（REPL/gdb/多步操作） |
 | `remote-runbook` skill | M4 | 工具路由规则 + 远程调试 playbook |
@@ -27,6 +27,12 @@ export PI_SSH_HOST=gpu-box   # ~/.ssh/config 里的 Host 别名
 ```
 
 主机、端口、密钥、ProxyJump 全部走 `~/.ssh/config`，扩展不重复实现。
+
+## 测试状态（诚实声明）
+
+已通过：transpile 语法校验、纯函数级冒烟（buildRemoteCommand 包裹顺序/引用安全/看门狗、
+parseRsyncStats 解析）。**未通过真实 sshd/rsync 端到端验收**（spec §8 需双 sshd 环境），
+请在目标环境逐条跑 §8 后再视为完成。
 
 ## 安全声明
 
