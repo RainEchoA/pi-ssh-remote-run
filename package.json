@@ -1,0 +1,17 @@
+{
+  "name": "pi-ssh-remote-run",
+  "version": "0.1.0",
+  "description": "Pi coding agent extension: local development, remote run & debug over a persistent SSH connection",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "ssh", "remote-development"],
+  "pi": {
+    "extensions": ["./src"]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
